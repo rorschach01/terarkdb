@@ -7,30 +7,43 @@
 
 #include <string>
 #include <vector>
+
 #include "port/port.h"
 #include "util/testharness.h"
 
 namespace rocksdb {
 
-class LRUCacheTest : public testing::Test {
+class LRUCacheTest : public testing::Test,
+                     virtual public testing::WithParamInterface<bool> {
  public:
-  LRUCacheTest() {}
+  LRUCacheTest() : is_diagnose_(GetParam()) {}
   ~LRUCacheTest() { DeleteCache(); }
 
   void DeleteCache() {
     if (cache_ != nullptr) {
-      cache_->~LRUCacheShard();
+      cache_->~CacheShard();
       port::cacheline_aligned_free(cache_);
       cache_ = nullptr;
     }
   }
 
+  void SetDiagnose(bool d) { is_diagnose_ = d; }
+
   void NewCache(size_t capacity, double high_pri_pool_ratio = 0.0) {
     DeleteCache();
-    cache_ = reinterpret_cast<LRUCacheShard*>(
-        port::cacheline_aligned_alloc(sizeof(LRUCacheShard)));
-    new (cache_) LRUCacheShard(capacity, false /*strict_capcity_limit*/,
-                               high_pri_pool_ratio);
+    if (is_diagnose_) {
+      cache_ = reinterpret_cast<LRUCacheDiagnosableShard*>(
+          port::cacheline_aligned_alloc(sizeof(LRUCacheDiagnosableShard)));
+      LRUCacheDiagnosableMonitor::Options mo;
+      mo.top_k = 10;
+      new (cache_) LRUCacheDiagnosableShard(
+          capacity, false /*strict_capcity_limit*/, high_pri_pool_ratio, mo);
+    } else {
+      cache_ = reinterpret_cast<LRUCacheShard*>(
+          port::cacheline_aligned_alloc(sizeof(LRUCacheShard)));
+      new (cache_) LRUCacheShard(capacity, false /*strict_capcity_limit*/,
+                                 high_pri_pool_ratio, {});
+    }
   }
 
   void Insert(const std::string& key,
@@ -60,7 +73,14 @@ class LRUCacheTest : public testing::Test {
                        size_t num_high_pri_pool_keys = 0) {
     LRUHandle* lru;
     LRUHandle* lru_low_pri;
-    cache_->TEST_GetLRUList(&lru, &lru_low_pri);
+    if (is_diagnose_) {u
+      reinterpret_cast<LRUCacheDiagnosableShard*>(cache_)->TEST_GetLRUList(
+          &lru, &lru_low_pri);
+    } else {
+      reinterpret_cast<LRUCacheShard*>(cache_)->TEST_GetLRUList(&lru,
+                                                                &lru_low_pri);
+    }
+
     LRUHandle* iter = lru;
     bool in_high_pri_pool = false;
     size_t high_pri_pool_keys = 0;
@@ -85,11 +105,17 @@ class LRUCacheTest : public testing::Test {
     ASSERT_EQ(num_high_pri_pool_keys, high_pri_pool_keys);
   }
 
+  void ValidatePinnedElements(
+      std::vector<LRUCacheDiagnosableMonitor::TopSet::DataElement> elements) {}
+
  private:
-  LRUCacheShard* cache_ = nullptr;
+  CacheShard* cache_ = nullptr;
+  bool is_diagnose_;
 };
 
-TEST_F(LRUCacheTest, BasicLRU) {
+INSTANTIATE_TEST_CASE_P(LRUCacheTest, LRUCacheTest, ::testing::Bool());
+
+TEST_P(LRUCacheTest, BasicLRU) {
   NewCache(5);
   for (char ch = 'a'; ch <= 'e'; ch++) {
     Insert(ch);
@@ -115,7 +141,7 @@ TEST_F(LRUCacheTest, BasicLRU) {
   ValidateLRUList({"e", "z", "d", "u", "v"});
 }
 
-TEST_F(LRUCacheTest, MidpointInsertion) {
+TEST_P(LRUCacheTest, MidpointInsertion) {
   // Allocate 2 cache entries to high-pri pool.
   NewCache(5, 0.45);
 
@@ -138,7 +164,7 @@ TEST_F(LRUCacheTest, MidpointInsertion) {
   ValidateLRUList({"c", "x", "y", "d", "z"}, 2);
 }
 
-TEST_F(LRUCacheTest, EntriesWithPriority) {
+TEST_P(LRUCacheTest, EntriesWithPriority) {
   // Allocate 2 cache entries to high-pri pool.
   NewCache(5, 0.45);
 
@@ -186,6 +212,17 @@ TEST_F(LRUCacheTest, EntriesWithPriority) {
   ValidateLRUList({"d", "e", "f", "g", "Z"}, 1);
   ASSERT_TRUE(Lookup("d"));
   ValidateLRUList({"e", "f", "g", "Z", "d"}, 2);
+}
+
+TEST_F(LRUCacheTest, LRUCacheDiagnosableMonitor) {
+  SetDiagnose(true);
+
+  Insert("a");
+  Insert("b");
+  Insert("c");
+  Insert("d");
+
+  Erase("a");
 }
 
 }  // namespace rocksdb
